@@ -1,0 +1,167 @@
+name: OpenAI tunnel-client v0.0.18 provenance verification
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  verify:
+    name: Verify public release evidence
+    runs-on: windows-2025
+    timeout-minutes: 20
+    permissions: {}
+    steps:
+      - name: Download, hash-check, and verify release evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'openai-tunnel-client-v0018-verify'
+          New-Item -ItemType Directory -Path $work -Force | Out-Null
+          $summary = $env:GITHUB_STEP_SUMMARY
+          $outcomes = [System.Collections.Generic.List[string]]::new()
+          try {
+            $stage = 'OpenAI release download and hash checks'
+            $releaseBase = 'https://github.com/openai/tunnel-client/releases/download/v0.0.18/'
+            $expected = [ordered]@{
+              'tunnel-client-v0.0.18-windows-amd64.zip' = '8D0DA1CE79532D44CCC5ED5D8BD36CDFFFBA37DFD287C602D69635C8BB5DB2B2'
+              'tunnel-client-v0.0.18-windows-amd64.spdx.json' = '6FDF06F5663980BB01E63417A6FA9DC0F42A20AA7F5498B7E444E6977BCC43D7'
+              'tunnel-client-v0.0.18-windows-amd64-licenses.txt' = '2B1DEF83C55DEA817579EA1A7206119356C6A97A190C31181FE7817AE60C29EC'
+              'SHA256SUMS.txt' = '63F9996246424301C8B0680C943C67D0EA7FE2F0853A234649104F8062C67329'
+              'tunnel-client-v0.0.18-provenance.sigstore.json' = 'C7AE172FF3A12B14EABB7996F1E77E58DEF625C00F9B6F807DC82BBD5F6EE346'
+            }
+            foreach ($name in $expected.Keys) {
+              $stage = 'OpenAI release asset: ' + $name
+              Invoke-WebRequest -Uri ($releaseBase + $name) -OutFile (Join-Path $work $name) | Out-Null
+              $actual = (Get-FileHash -LiteralPath (Join-Path $work $name) -Algorithm SHA256).Hash.ToUpperInvariant()
+              if ($actual -ne $expected[$name]) { throw "Release file hash mismatch: $name" }
+            }
+
+            $checksumFile = Join-Path $work 'SHA256SUMS.txt'
+            foreach ($name in @(
+              'tunnel-client-v0.0.18-windows-amd64.zip',
+              'tunnel-client-v0.0.18-windows-amd64.spdx.json',
+              'tunnel-client-v0.0.18-windows-amd64-licenses.txt'
+            )) {
+              $lines = @(Get-Content -LiteralPath $checksumFile | Where-Object { $_ -match ('\s' + [regex]::Escape($name) + '$') })
+              if ($lines.Count -ne 1) { throw "Checksum manifest entry missing or duplicated: $name" }
+              $listed = ($lines[0] -split '\s+')[0].ToUpperInvariant()
+              $observed = (Get-FileHash -LiteralPath (Join-Path $work $name) -Algorithm SHA256).Hash.ToUpperInvariant()
+              if ($listed -ne $observed) { throw "Published checksum mismatch: $name" }
+            }
+
+            $stage = 'GitHub CLI v2.103.3 download and integrity checks'
+            $ghZipName = 'gh_2.103.3_windows_amd64.zip'
+            $ghChecksName = 'gh_2.103.3_checksums.txt'
+            $ghZip = Join-Path $work $ghZipName
+            $ghChecks = Join-Path $work $ghChecksName
+            $ghBase = 'https://github.com/cli/cli/releases/download/v2.103.3/'
+            Invoke-WebRequest -Uri ($ghBase + $ghChecksName) -OutFile $ghChecks | Out-Null
+            Invoke-WebRequest -Uri ($ghBase + $ghZipName) -OutFile $ghZip | Out-Null
+            $ghChecksHash = (Get-FileHash -LiteralPath $ghChecks -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($ghChecksHash -ne 'f756e7859d90dbb5e85aae5194206c37da220bec9bac23d3d659078a8e766fdc') { throw 'GitHub CLI checksum-file hash mismatch' }
+            $ghZipHash = (Get-FileHash -LiteralPath $ghZip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($ghZipHash -ne '98d0cfa794721665d7973dd728c78aff7bd836d58f10f6d7a03568eccb0a22e0') { throw 'GitHub CLI ZIP hash mismatch' }
+            $ghLines = @(Get-Content -LiteralPath $ghChecks | Where-Object { $_ -match ('\s\*?' + [regex]::Escape($ghZipName) + '$') })
+            if ($ghLines.Count -ne 1 -or ($ghLines[0] -split '\s+')[0].ToLowerInvariant() -ne $ghZipHash) { throw 'GitHub CLI published checksum entry mismatch' }
+            $ghDir = Join-Path $work 'gh'
+            Expand-Archive -LiteralPath $ghZip -DestinationPath $ghDir
+            $ghMatches = @(Get-ChildItem -LiteralPath $ghDir -Filter 'gh.exe' -File -Recurse)
+            if ($ghMatches.Count -ne 1) { throw 'Expected exactly one gh.exe in pinned ZIP' }
+            $gh = $ghMatches[0].FullName
+            $versionOutput = & $gh --version 2>&1
+            $versionExit = $LASTEXITCODE
+            if ($versionExit -ne 0 -or (($versionOutput -join "`n") -notmatch 'gh version 2\.103\.3')) { throw 'Pinned GitHub CLI version check failed' }
+
+            $stage = 'Verify public release tag commit'
+            $tagLines = @(& git ls-remote --tags 'https://github.com/openai/tunnel-client.git' 'refs/tags/v0.0.18' 'refs/tags/v0.0.18^{}')
+            $tagExit = $LASTEXITCODE
+            if ($tagExit -ne 0) { throw 'Could not read public v0.0.18 tag reference' }
+            $tagRefs = @($tagLines | ForEach-Object {
+              $parts = $_ -split "`t", 2
+              if ($parts.Count -eq 2) { [pscustomobject]@{ Hash = $parts[0].ToLowerInvariant(); Ref = $parts[1] } }
+            })
+            $resolvedTag = $tagRefs | Where-Object Ref -eq 'refs/tags/v0.0.18^{}' | Select-Object -First 1
+            if (-not $resolvedTag) { $resolvedTag = $tagRefs | Where-Object Ref -eq 'refs/tags/v0.0.18' | Select-Object -First 1 }
+            if (-not $resolvedTag -or $resolvedTag.Hash -ne '274a5588414819f063d27100a4fb1096aae3830f') { throw 'Public release tag does not resolve to the approved source commit' }
+
+            $bundle = Join-Path $work 'tunnel-client-v0.0.18-provenance.sigstore.json'
+            $rootFile = Join-Path $work 'trusted_root.jsonl'
+            $stage = 'TUF trusted-root retrieval'
+            $rootErrorFile = Join-Path $work 'trusted-root-stderr.txt'
+            $rootOutput = & $gh attestation trusted-root 2> $rootErrorFile
+            $rootExit = $LASTEXITCODE
+            if ($rootExit -ne 0) { throw "TUF trusted-root retrieval failed or was inconclusive (exit $rootExit)" }
+            $rootText = ($rootOutput | ForEach-Object { $_.ToString() }) -join "`n"
+            [System.IO.File]::WriteAllText($rootFile, $rootText + "`n", [System.Text.UTF8Encoding]::new($false))
+            $rootHash = (Get-FileHash -LiteralPath $rootFile -Algorithm SHA256).Hash.ToUpperInvariant()
+
+            $repo = 'openai/tunnel-client'
+            $signerWorkflow = 'openai/tunnel-client/.github/workflows/release.yml'
+            $sourceRef = 'refs/tags/v0.0.18'
+            $sourceDigest = '274a5588414819f063d27100a4fb1096aae3830f'
+            $predicate = 'https://slsa.dev/provenance/v1'
+            $subjects = @(
+              'tunnel-client-v0.0.18-windows-amd64.zip',
+              'tunnel-client-v0.0.18-windows-amd64.spdx.json',
+              'tunnel-client-v0.0.18-windows-amd64-licenses.txt',
+              'SHA256SUMS.txt'
+            )
+            foreach ($name in $subjects) {
+              $stage = 'Attestation check: ' + $name
+              $subject = Join-Path $work $name
+              $verifyOutput = & $gh attestation verify $subject `
+                --bundle $bundle `
+                --custom-trusted-root $rootFile `
+                --repo $repo `
+                --signer-workflow $signerWorkflow `
+                --source-ref $sourceRef `
+                --source-digest $sourceDigest `
+                --signer-digest $sourceDigest `
+                --predicate-type $predicate `
+                --deny-self-hosted-runners 2>&1
+              $verifyExit = $LASTEXITCODE
+              if ($verifyExit -ne 0) { throw "Attestation check failed or was inconclusive for $name (exit $verifyExit)" }
+              $outcomes.Add("PASS — $name")
+            }
+
+            $inputRows = foreach ($name in $expected.Keys) {
+              $file = Join-Path $work $name
+              $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToUpperInvariant()
+              "| $name | $hash |"
+            }
+            @(
+              '# Tunnel-client v0.0.18 provenance verification',
+              '',
+              '- Runner: standard `windows-2025` GitHub-hosted runner',
+              '- GitHub CLI: v2.103.3; ZIP SHA-256: `' + $ghZipHash + '`; checksum-file SHA-256: `' + $ghChecksHash.ToUpperInvariant() + '`',
+              '- Trusted root: fetched with the documented TUF command; SHA-256: `' + $rootHash + '`',
+              '- Policy: `openai/tunnel-client`; `openai/tunnel-client/.github/workflows/release.yml`; `refs/tags/v0.0.18`; source/signer digest `274a5588414819f063d27100a4fb1096aae3830f`; SLSA provenance v1; self-hosted runners denied.',
+              '',
+              '| Public input | Observed SHA-256 |',
+              '|---|---|',
+              $inputRows,
+              '',
+              '## Attestation results',
+              '',
+              $outcomes
+            ) | Add-Content -LiteralPath $summary -Encoding utf8
+          }
+          catch {
+            $stopLines = @(
+              '## Verification stopped', '', '- Result: failed or inconclusive; no policy fallback was attempted.', '', '- Stage: ' + $stage, '', '## Attestation checks completed before stop', ''
+            ) + $outcomes
+            $stopLines | Add-Content -LiteralPath $summary -Encoding utf8
+            throw 'The verification stopped at the stated stage; review the sanitized summary.'
+          }
+          finally {
+            try {
+              if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction Stop }
+              if (Test-Path -LiteralPath $work) { throw 'Temporary directory still exists' }
+              '- Runner temporary-file cleanup: PASS' | Add-Content -LiteralPath $summary -Encoding utf8
+            }
+            catch {
+              '- Runner temporary-file cleanup: FAIL' | Add-Content -LiteralPath $summary -Encoding utf8
+              throw 'Runner temporary-file cleanup failed.'
+            }
+          }
